@@ -363,6 +363,8 @@ async function cmdAuto(side, amount) {
 
 const BINANCE_BASE = "https://api.binance.com";
 const STRATEGY_CONFIDENCE = parseFloat(process.env.STRATEGY_CONFIDENCE || "0.05"); // 最小价格变化百分比
+const LOW_VOL_THRESHOLD = parseFloat(process.env.LOW_VOL_THRESHOLD || "0.15");     // 低波动阈值 (%)
+const LAST_MINUTE_WINDOW = 60; // 最后1分钟窗口 (秒)
 
 // 获取 BTC 当前价格
 async function fetchBtcPrice() {
@@ -429,8 +431,39 @@ async function analyzeTrend() {
   score += volTrend * 10;                  // 成交量趋势
 
   // 决策
-  let side = score > 0 ? "UP" : "DOWN";
+  const secondsLeft = getSecondsUntilClose();
+  const isLastMinute = secondsLeft < LAST_MINUTE_WINDOW;
+  const isLowVol = Math.abs(change5m) < LOW_VOL_THRESHOLD;
+
+  let side;
   let confidence = Math.abs(change5m);
+  let mode; // "reversal" | "trend" | "skip"
+
+  if (isLowVol) {
+    if (isLastMinute) {
+      // 低波动 + 最后1分钟 → 反转模式
+      // 数据验证: 最后1分钟下跌→反转UP胜率69.4%，上涨→反转DOWN胜率50%
+      // 只在最后1分钟下跌时反转，上涨时跳过
+      if (change5m < -0.01) {
+        mode = "reversal";
+        side = "UP"; // 押反转上涨 (69.4% 胜率)
+      } else if (change5m > 0.01) {
+        mode = "skip";
+        side = null; // 上涨反转信号弱，跳过
+      } else {
+        mode = "reversal";
+        side = score > 0 ? "UP" : "DOWN"; // 变化极小时用趋势评分
+      }
+    } else {
+      // 低波动但不在最后1分钟 → 信号太弱，跳过
+      mode = "skip";
+      side = null;
+    }
+  } else {
+    // 正常波动 → 趋势模式: 跟随综合评分
+    mode = "trend";
+    side = score > 0 ? "UP" : "DOWN";
+  }
 
   const details = {
     currentPrice: currentPrice.toFixed(2),
@@ -439,6 +472,10 @@ async function analyzeTrend() {
     positionInRange: positionInRange.toFixed(2),
     volTrend: volTrend > 0 ? "放量" : "缩量",
     score: score.toFixed(1),
+    mode,
+    isLastMinute,
+    isLowVol,
+    secondsLeft,
   };
 
   return { side, confidence, currentPrice, details };
@@ -446,15 +483,27 @@ async function analyzeTrend() {
 
 // 打印策略分析结果
 function printStrategy(analysis) {
+  const d = analysis.details;
+  const modeLabel = d.mode === "reversal" ? "反转模式" : d.mode === "skip" ? "跳过 (低波动)" : "趋势模式";
+  const volLabel = d.isLowVol ? "低波动" : "正常波动";
+  const lastMinLabel = d.isLastMinute ? `是 (${d.secondsLeft}s)` : `否 (${d.secondsLeft}s)`;
+
   console.log(`\n${"=".repeat(55)}`);
   console.log(`  🔍 Binance BTC 策略分析`);
-  console.log(`  当前价格: $${analysis.details.currentPrice}`);
-  console.log(`  最新K线涨跌: ${analysis.details.latestChange}`);
-  console.log(`  5分钟变化: ${analysis.details.change5m}`);
-  console.log(`  区间位置: ${analysis.details.positionInRange} (0=底部, 1=顶部)`);
-  console.log(`  成交量趋势: ${analysis.details.volTrend}`);
-  console.log(`  综合评分: ${analysis.details.score}`);
-  console.log(`  ➡️  建议方向: ${analysis.side} (置信度: ${analysis.confidence.toFixed(3)}%)`);
+  console.log(`  当前价格: $${d.currentPrice}`);
+  console.log(`  最新K线涨跌: ${d.latestChange}`);
+  console.log(`  5分钟变化: ${d.change5m}`);
+  console.log(`  区间位置: ${d.positionInRange} (0=底部, 1=顶部)`);
+  console.log(`  成交量趋势: ${d.volTrend}`);
+  console.log(`  综合评分: ${d.score}`);
+  console.log(`  波动状态: ${volLabel} (阈值: ${LOW_VOL_THRESHOLD}%)`);
+  console.log(`  最后一分钟: ${lastMinLabel}`);
+  console.log(`  策略模式: ${modeLabel}`);
+  if (analysis.side) {
+    console.log(`  ➡️  建议方向: ${analysis.side} (置信度: ${analysis.confidence.toFixed(3)}%)`);
+  } else {
+    console.log(`  ➡️  建议: 跳过 (波动不足，未到最后一分钟)`);
+  }
   console.log(`${"=".repeat(55)}\n`);
 }
 
