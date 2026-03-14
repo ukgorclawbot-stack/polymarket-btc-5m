@@ -1,0 +1,20 @@
+{
+  "name": "polymarket-btc-5m",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.mjs",
+  "type": "module",
+  "scripts": {
+    "info": "node index.mjs info",
+    "buy": "node index.mjs buy",
+    "auto": "node index.mjs auto"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@polymarket/clob-client": "^5.8.0",
+    "dotenv": "^17.3.1",
+    "ethers": "^5.8.0"
+  }
+}
