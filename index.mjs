@@ -10,6 +10,7 @@
  *   node index.mjs limit down <价格> <数量>       # 限价买 DOWN
  *   node index.mjs orders                        # 查看未成交订单
  *   node index.mjs cancel                        # 取消所有订单
+ *   node index.mjs balance                       # 查看 USDC 余额和持仓
  *   node index.mjs auto up [金额]                # 自动模式: 每个窗口买 UP
  *   node index.mjs auto down [金额]              # 自动模式: 每个窗口买 DOWN
  *   node index.mjs book up                       # 查看 UP 的订单簿
@@ -17,7 +18,7 @@
  */
 
 import "dotenv/config";
-import { ClobClient, OrderType, Side } from "@polymarket/clob-client";
+import { ClobClient, OrderType, Side, AssetType } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
 
 // ============ 配置 ============
@@ -141,9 +142,13 @@ async function getClient() {
 
   const signer = new Wallet(PRIVATE_KEY);
 
-  // 先创建临时客户端获取 API credentials
-  const tempClient = new ClobClient(CLOB_HOST, CHAIN_ID, signer);
+  // 使用正确的签名类型和代理钱包创建客户端
+  const tempClient = new ClobClient(CLOB_HOST, CHAIN_ID, signer, undefined, SIGNATURE_TYPE, FUNDER_ADDRESS || undefined);
+  // 抑制 createOrDeriveApiKey 内部的 "Could not create api key" 错误日志
+  const origError = console.error;
+  console.error = () => {};
   const creds = await tempClient.createOrDeriveApiKey();
+  console.error = origError;
 
   _client = new ClobClient(
     CLOB_HOST,
@@ -190,9 +195,25 @@ async function cmdBuy(side, amount) {
     return;
   }
 
-  console.log(`[下单] 方向=${side}, 金额=$${amount.toFixed(2)}, 当前价格=$${priceDisplay.toFixed(2)}`);
-
   const client = await getClient();
+
+  // 下单前检查余额
+  try {
+    const collateral = await client.getBalanceAllowance({
+      asset_type: AssetType.COLLATERAL,
+    });
+    const rawBal = parseFloat(collateral.balance || "0");
+    const balance = rawBal / 1e6;
+    console.log(`[余额] USDC: $${balance.toFixed(2)}`);
+    if (balance < amount) {
+      console.log(`[错误] 余额不足: 需要 $${amount.toFixed(2)}, 当前 $${balance.toFixed(2)}`);
+      return;
+    }
+  } catch (e) {
+    console.log(`[警告] 余额检查失败 (${e.message}), 继续尝试下单...`);
+  }
+
+  console.log(`[下单] 方向=${side}, 金额=$${amount.toFixed(2)}, 当前价格=$${priceDisplay.toFixed(2)}`);
 
   try {
     const resp = await client.createAndPostMarketOrder(
@@ -320,6 +341,80 @@ async function cmdCancel() {
   console.log("[结果]", JSON.stringify(resp, null, 2));
 }
 
+async function cmdBalance() {
+  const client = await getClient();
+
+  console.log(`\n${"=".repeat(55)}`);
+  console.log(`  💰 Polymarket 账户余额`);
+
+  // 查询 USDC (COLLATERAL) 余额和授权额度
+  try {
+    const collateral = await client.getBalanceAllowance({
+      asset_type: AssetType.COLLATERAL,
+    });
+    const rawBalance = parseFloat(collateral.balance || "0");
+    // USDC 有 6 位小数
+    const balance = rawBalance / 1e6;
+    console.log(`  USDC 余额: $${balance.toFixed(2)}`);
+
+    // allowances 可能是对象 {contractAddress: "amount"} 或字符串
+    if (collateral.allowances && typeof collateral.allowances === "object") {
+      for (const [contract, amt] of Object.entries(collateral.allowances)) {
+        const val = parseFloat(amt) / 1e6;
+        if (val > 0) {
+          console.log(`  授权额度 (${contract.slice(0, 10)}...): $${val.toFixed(2)}`);
+        }
+      }
+    } else if (collateral.allowance) {
+      const allowance = parseFloat(collateral.allowance) / 1e6;
+      console.log(`  USDC 授权额度: $${allowance.toFixed(2)}`);
+    }
+
+    if (balance === 0) {
+      console.log(`  ⚠️  余额为零，请先向代理钱包充值 USDC`);
+    }
+  } catch (e) {
+    console.error(`  [错误] 获取 USDC 余额失败: ${e.message}`);
+  }
+
+  // 如果有当前市场，也查询条件代币余额
+  try {
+    const event = await getCurrentMarket();
+    if (event) {
+      const info = parseMarketTokens(event);
+      if (info.upTokenId) {
+        const upBal = await client.getBalanceAllowance({
+          asset_type: AssetType.CONDITIONAL,
+          token_id: info.upTokenId,
+        });
+        const upBalance = parseFloat(upBal.balance || "0");
+        if (upBalance > 0) {
+          console.log(`  UP 持仓: ${(upBalance / 1e6).toFixed(2)} 份`);
+        }
+      }
+      if (info.downTokenId) {
+        const downBal = await client.getBalanceAllowance({
+          asset_type: AssetType.CONDITIONAL,
+          token_id: info.downTokenId,
+        });
+        const downBalance = parseFloat(downBal.balance || "0");
+        if (downBalance > 0) {
+          console.log(`  DOWN 持仓: ${(downBalance / 1e6).toFixed(2)} 份`);
+        }
+      }
+    }
+  } catch (e) {
+    // 条件代币余额获取失败不影响主流程
+  }
+
+  const signer = new Wallet(PRIVATE_KEY);
+  console.log(`  钱包地址: ${signer.address}`);
+  if (FUNDER_ADDRESS) {
+    console.log(`  代理钱包: ${FUNDER_ADDRESS}`);
+  }
+  console.log(`${"=".repeat(55)}\n`);
+}
+
 async function cmdAuto(side, amount) {
   amount = amount || DEFAULT_BET_AMOUNT;
   side = side.toUpperCase();
@@ -364,6 +459,7 @@ async function cmdAuto(side, amount) {
 const BINANCE_BASE = "https://api.binance.com";
 const STRATEGY_CONFIDENCE = parseFloat(process.env.STRATEGY_CONFIDENCE || "0.05"); // 最小价格变化百分比
 const LOW_VOL_THRESHOLD = parseFloat(process.env.LOW_VOL_THRESHOLD || "0.15");     // 低波动阈值 (%)
+const OVERCONFIDENCE_THRESHOLD = parseFloat(process.env.OVERCONFIDENCE_THRESHOLD || "0.20"); // 过度自信阈值
 const LAST_MINUTE_WINDOW = 60; // 最后1分钟窗口 (秒)
 
 // 获取 BTC 当前价格
@@ -507,12 +603,53 @@ function printStrategy(analysis) {
   console.log(`${"=".repeat(55)}\n`);
 }
 
+// 过度自信反转检测: 在趋势分析之前检查市场价格
+function checkOverconfidence(info, change5m) {
+  const isFalling = change5m < 0;
+  const isRising = change5m > 0;
+
+  if (isFalling && info.downPrice > OVERCONFIDENCE_THRESHOLD) {
+    return { triggered: true, side: "UP", reason: `价格下跌 + DOWN价格 $${info.downPrice.toFixed(2)} > $${OVERCONFIDENCE_THRESHOLD} → 反转买UP` };
+  }
+  if (isRising && info.upPrice > OVERCONFIDENCE_THRESHOLD) {
+    return { triggered: true, side: "DOWN", reason: `价格上涨 + UP价格 $${info.upPrice.toFixed(2)} > $${OVERCONFIDENCE_THRESHOLD} → 反转买DOWN` };
+  }
+  return { triggered: false };
+}
+
 // 单次策略执行
 async function cmdStrategy(amount) {
   amount = amount || DEFAULT_BET_AMOUNT;
 
   console.log("[策略] 开始分析 Binance BTC 价格趋势...");
 
+  // 获取市场数据用于过度自信检测
+  const event = await getCurrentMarket();
+  if (!event) {
+    console.log("[错误] 未找到当前活跃的 BTC 5分钟市场");
+    return;
+  }
+  const info = parseMarketTokens(event);
+
+  // 获取当前价格变化用于方向判断
+  const currentPrice = await fetchBtcPrice();
+  const klines = await fetchBtcKlines(6);
+  const price5mAgo = klines.length > 0 ? klines[0].open : currentPrice;
+  const change5m = ((currentPrice - price5mAgo) / price5mAgo) * 100;
+
+  // 先检查过度自信反转
+  const overconf = checkOverconfidence(info, change5m);
+  if (overconf.triggered) {
+    console.log(`\n[过度自信反转] ${overconf.reason}`);
+    console.log(`[过度自信反转] UP价格=$${info.upPrice.toFixed(2)}, DOWN价格=$${info.downPrice.toFixed(2)}, 阈值=$${OVERCONFIDENCE_THRESHOLD}`);
+    console.log(`[过度自信反转] 5分钟变化: ${change5m.toFixed(3)}%`);
+    printMarketInfo(info);
+    console.log(`[策略] 过度自信反转选择方向: ${overconf.side}`);
+    await cmdBuy(overconf.side, amount);
+    return;
+  }
+
+  // 正常趋势/反转分析
   const analysis = await analyzeTrend();
   printStrategy(analysis);
 
@@ -547,6 +684,25 @@ async function cmdStrategyAuto(amount) {
       // 在新窗口开始时 (窗口前15秒内) 进行策略评估并下单
       if (currentWindow !== lastWindow && remaining > MARKET_INTERVAL - 15) {
         console.log(`\n[自动策略] 新窗口: ${currentWindow} (${new Date(currentWindow * 1000).toISOString()})`);
+
+        // 先检查过度自信反转
+        const event = await getCurrentMarket();
+        if (event) {
+          const info = parseMarketTokens(event);
+          const currentPrice = await fetchBtcPrice();
+          const klines = await fetchBtcKlines(6);
+          const price5mAgo = klines.length > 0 ? klines[0].open : currentPrice;
+          const change5m = ((currentPrice - price5mAgo) / price5mAgo) * 100;
+
+          const overconf = checkOverconfidence(info, change5m);
+          if (overconf.triggered) {
+            console.log(`[过度自信反转] ${overconf.reason}`);
+            await cmdBuy(overconf.side, amount);
+            lastWindow = currentWindow;
+            await new Promise((r) => setTimeout(r, 5000));
+            continue;
+          }
+        }
 
         const analysis = await analyzeTrend();
         printStrategy(analysis);
@@ -615,6 +771,10 @@ async function main() {
       await cmdCancel();
       break;
 
+    case "balance":
+      await cmdBalance();
+      break;
+
     case "auto": {
       const side = args[1] || process.env.BET_SIDE || "";
       if (!side) {
@@ -649,9 +809,18 @@ Polymarket BTC 5分钟市场下单工具
   book <up|down>                查看订单簿
   orders                       查看未成交订单
   cancel                       取消所有订单
+  balance                      查看 USDC 余额和持仓
   auto <up|down> [金额]         自动模式 (每个窗口自动下单)
   strategy [金额]               Binance趋势策略 (单次评估并下单)
   strategy-auto [金额]          Binance趋势策略 (连续自动)
+
+策略模式说明:
+  strategy/strategy-auto 会先检查"过度自信反转":
+    - 价格下跌 + DOWN市场价 > $${OVERCONFIDENCE_THRESHOLD} → 市场过度看跌 → 反转买UP
+    - 价格上涨 + UP市场价 > $${OVERCONFIDENCE_THRESHOLD} → 市场过度看涨 → 反转买DOWN
+  若未触发过度自信，则进入正常趋势/反转逻辑:
+    - 低波动 + 最后1分钟下跌 → 反转模式 (买UP)
+    - 正常波动 → 趋势模式 (跟随综合评分)
 
 示例:
   node index.mjs info

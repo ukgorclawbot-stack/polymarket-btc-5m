@@ -7,12 +7,14 @@
   "scripts": {
     "info": "node index.mjs info",
     "buy": "node index.mjs buy",
-    "auto": "node index.mjs auto"
+    "auto": "node index.mjs auto",
+    "collect": "node collect-data.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@polymarket/builder-relayer-client": "^0.0.8",
     "@polymarket/clob-client": "^5.8.0",
     "dotenv": "^17.3.1",
     "ethers": "^5.8.0"
