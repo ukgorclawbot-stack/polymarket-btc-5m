@@ -20,6 +20,8 @@
 import "dotenv/config";
 import { ClobClient, OrderType, Side, AssetType } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
+import { JsonRpcProvider } from "@ethersproject/providers";
+import { Contract } from "@ethersproject/contracts";
 
 // ============ 配置 ============
 
@@ -669,49 +671,129 @@ async function cmdStrategy(amount) {
 
 // ============ 自动 Redeem 获胜仓位 ============
 
+const POLYGON_RPC = "https://polygon-bor-rpc.publicnode.com";
+const CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+const MULTISEND_ADDR = "0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761";
+const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
+const ZERO_BYTES32 = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
 async function cmdRedeem() {
-  const provider = new providers.JsonRpcProvider('https://1rpc.io/matic');
+  if (!FUNDER_ADDRESS || SIGNATURE_TYPE !== 2) {
+    console.log("[Redeem] 需要 FUNDER_ADDRESS 和 SIGNATURE_TYPE=2 (Gnosis Safe)");
+    return;
+  }
+
+  const provider = new JsonRpcProvider(POLYGON_RPC);
   const signer = new Wallet(PRIVATE_KEY, provider);
-  
-  const ctfAddress = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
-  const ctfAbi = [
-    'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] outcomeIndexes) public',
-  ];
-  const ctf = new Contract(ctfAddress, ctfAbi, signer);
-  
-  const usdce = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
-  const parentCollectionId = '0x0000000000000000000000000000000000000000000000000000000000000000';
-  
+  const safeAddress = FUNDER_ADDRESS;
+
+  const ctf = new Contract(CTF_ADDRESS, [
+    "function balanceOf(address, uint256) view returns (uint256)",
+    "function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)",
+  ], provider);
+
   const now = Math.floor(Date.now() / 1000);
-  let redeemed = 0;
-  
-  for (let i = 2; i <= 6; i++) {
+  const redeemTxs = [];
+
+  // 检查最近 2~7 个已结算窗口
+  for (let i = 2; i <= 7; i++) {
     const windowTs = now - (now % MARKET_INTERVAL) - (i * MARKET_INTERVAL);
     const slug = getMarketSlug(windowTs);
     const event = await fetchMarket(slug);
     if (!event) continue;
-    
+
     const market = (event.markets || [])[0];
-    if (!market || !market.conditionId) continue;
-    
+    if (!market?.conditionId) continue;
+
+    const info = parseMarketTokens(event);
+
+    let upBal, downBal;
     try {
-      const tx = await ctf.redeemPositions(usdce, parentCollectionId, market.conditionId, [0, 1]);
-      console.log(`[Redeem] ${slug} — tx: ${tx.hash.slice(0, 20)}...`);
-      await tx.wait();
-      redeemed++;
-    } catch (e) {
-      if (e.message?.includes('already') || e.message?.includes('nothing')) {
-        console.log(`[Redeem] ${slug} — 已领取或无仓位`);
-      } else {
-        console.log(`[Redeem] ${slug} — 跳过: ${(e.reason || e.message || '').slice(0, 80)}`);
-      }
+      upBal = info.upTokenId ? await ctf.balanceOf(safeAddress, info.upTokenId) : 0;
+      downBal = info.downTokenId ? await ctf.balanceOf(safeAddress, info.downTokenId) : 0;
+    } catch {
+      continue;
     }
+
+    const upZero = typeof upBal === "object" ? upBal.isZero() : upBal === 0;
+    const downZero = typeof downBal === "object" ? downBal.isZero() : downBal === 0;
+    if (upZero && downZero) continue;
+
+    console.log(`[Redeem] ${slug}: UP=${upBal.toString()}, DOWN=${downBal.toString()}`);
+
+    // 直接调用 CTF.redeemPositions (indexSets: 1=outcome0, 2=outcome1)
+    const data = ctf.interface.encodeFunctionData("redeemPositions", [
+      USDC_ADDRESS, ZERO_BYTES32, market.conditionId, [1, 2],
+    ]);
+    redeemTxs.push({ to: CTF_ADDRESS, data });
   }
-  
-  if (redeemed > 0) {
-    console.log(`\n✅ 成功领取 ${redeemed} 个市场的奖励`);
+
+  if (redeemTxs.length === 0) {
+    console.log("[Redeem] 没有需要赎回的仓位");
+    return;
+  }
+
+  // 构建 Safe 交易
+  const safeContract = new Contract(safeAddress, [
+    "function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address payable refundReceiver, bytes signatures) payable returns (bool)",
+    "function nonce() view returns (uint256)",
+    "function getTransactionHash(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, uint256 _nonce) view returns (bytes32)",
+  ], signer);
+
+  let targetTo, targetData, operation;
+
+  if (redeemTxs.length === 1) {
+    // 单笔赎回 — 直接 Call
+    targetTo = redeemTxs[0].to;
+    targetData = redeemTxs[0].data;
+    operation = 0;
   } else {
-    console.log("\n[Redeem] 本次没有需要领取的奖励");
+    // 多笔赎回 — MultiSend + DelegateCall
+    let packedHex = "";
+    for (const tx of redeemTxs) {
+      const dataNoPrefix = tx.data.slice(2);
+      const dataLen = dataNoPrefix.length / 2;
+      packedHex += "00"; // operation = Call
+      packedHex += tx.to.slice(2).toLowerCase().padStart(40, "0");
+      packedHex += "0".repeat(64); // value = 0
+      packedHex += dataLen.toString(16).padStart(64, "0");
+      packedHex += dataNoPrefix;
+    }
+    const multiSend = new Contract(MULTISEND_ADDR, [
+      "function multiSend(bytes)",
+    ], provider);
+    targetTo = MULTISEND_ADDR;
+    targetData = multiSend.interface.encodeFunctionData("multiSend", ["0x" + packedHex]);
+    operation = 1; // DelegateCall
+  }
+
+  const nonce = await safeContract.nonce();
+  const txHash = await safeContract.getTransactionHash(
+    targetTo, 0, targetData, operation, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, nonce
+  );
+
+  // eth_sign 签名 (v += 4 表示 Safe 的 eth_sign 类型)
+  const sig = await signer.signMessage(Buffer.from(txHash.slice(2), "hex"));
+  const sigBytes = Buffer.from(sig.slice(2), "hex");
+  sigBytes[64] += 4;
+  const signature = "0x" + sigBytes.toString("hex");
+
+  console.log(`[Redeem] 提交 Safe 交易 (${redeemTxs.length} 个市场)...`);
+  try {
+    const tx = await safeContract.execTransaction(
+      targetTo, 0, targetData, operation, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, signature,
+      { gasLimit: 500000, maxPriorityFeePerGas: 30000000000n, maxFeePerGas: 100000000000n }
+    );
+    console.log(`[Redeem] TX: ${tx.hash}`);
+    const receipt = await tx.wait();
+    if (receipt.status === 1) {
+      console.log(`[Redeem] 成功赎回 ${redeemTxs.length} 个市场的仓位`);
+    } else {
+      console.log("[Redeem] 交易失败");
+    }
+  } catch (e) {
+    console.log(`[Redeem] 执行失败: ${(e.reason || e.message || "").slice(0, 100)}`);
   }
 }
 
@@ -850,6 +932,7 @@ async function main() {
     }
 
     case "redeem":
+    case "claim":
       await cmdRedeem();
       break;
 
@@ -868,7 +951,7 @@ Polymarket BTC 5分钟市场下单工具
   auto <up|down> [金额]         自动模式 (每个窗口自动下单)
   strategy [金额]               Binance趋势策略 (单次评估并下单)
   strategy-auto [金额]          Binance趋势策略 (连续自动)
-  redeem                        领取获胜仓位奖励 (手动)
+  redeem / claim                领取获胜仓位奖励 (手动)
 
 策略模式说明:
   strategy/strategy-auto 会先检查"过度自信反转":
