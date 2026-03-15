@@ -667,9 +667,9 @@ async function cmdStrategy(amount) {
   await cmdBuy(analysis.side, amount);
 }
 
-// ============ 自动 Claim 获胜仓位 ============
+// ============ 自动 Redeem 获胜仓位 ============
 
-async function cmdClaim() {
+async function cmdRedeem() {
   const provider = new providers.JsonRpcProvider('https://1rpc.io/matic');
   const signer = new Wallet(PRIVATE_KEY, provider);
   
@@ -683,7 +683,7 @@ async function cmdClaim() {
   const parentCollectionId = '0x0000000000000000000000000000000000000000000000000000000000000000';
   
   const now = Math.floor(Date.now() / 1000);
-  let claimed = 0;
+  let redeemed = 0;
   
   for (let i = 2; i <= 6; i++) {
     const windowTs = now - (now % MARKET_INTERVAL) - (i * MARKET_INTERVAL);
@@ -696,22 +696,22 @@ async function cmdClaim() {
     
     try {
       const tx = await ctf.redeemPositions(usdce, parentCollectionId, market.conditionId, [0, 1]);
-      console.log(`[Claim] ${slug} — tx: ${tx.hash.slice(0, 20)}...`);
+      console.log(`[Redeem] ${slug} — tx: ${tx.hash.slice(0, 20)}...`);
       await tx.wait();
-      claimed++;
+      redeemed++;
     } catch (e) {
       if (e.message?.includes('already') || e.message?.includes('nothing')) {
-        console.log(`[Claim] ${slug} — 已领取或无仓位`);
+        console.log(`[Redeem] ${slug} — 已领取或无仓位`);
       } else {
-        console.log(`[Claim] ${slug} — 跳过: ${(e.reason || e.message || '').slice(0, 80)}`);
+        console.log(`[Redeem] ${slug} — 跳过: ${(e.reason || e.message || '').slice(0, 80)}`);
       }
     }
   }
   
-  if (claimed > 0) {
-    console.log(`\n✅ 成功领取 ${claimed} 个市场的奖励`);
+  if (redeemed > 0) {
+    console.log(`\n✅ 成功领取 ${redeemed} 个市场的奖励`);
   } else {
-    console.log("\n[Claim] 本次没有需要领取的奖励");
+    console.log("\n[Redeem] 本次没有需要领取的奖励");
   }
 }
 
@@ -732,7 +732,7 @@ async function cmdStrategyAuto(amount) {
       // 在新窗口开始时自动领取上一轮奖励
       if (currentWindow !== lastWindow && remaining > MARKET_INTERVAL - 15) {
         // 先尝试领取获胜仓位
-        try { await cmdClaim(); } catch(e) { console.log(`[Claim] 跳过: ${e.message?.slice(0, 50)}`); }
+        try { await cmdRedeem(); } catch(e) { console.log(`[Redeem] 跳过: ${e.message?.slice(0, 50)}`); }
         
         console.log(`\n[自动策略] 新窗口: ${currentWindow} (${new Date(currentWindow * 1000).toISOString()})`);
 
@@ -849,8 +849,8 @@ async function main() {
       break;
     }
 
-    case "claim":
-      await cmdClaim();
+    case "redeem":
+      await cmdRedeem();
       break;
 
     default:
@@ -868,7 +868,7 @@ Polymarket BTC 5分钟市场下单工具
   auto <up|down> [金额]         自动模式 (每个窗口自动下单)
   strategy [金额]               Binance趋势策略 (单次评估并下单)
   strategy-auto [金额]          Binance趋势策略 (连续自动)
-  claim                        领取获胜仓位奖励 (手动)
+  redeem                        领取获胜仓位奖励 (手动)
 
 策略模式说明:
   strategy/strategy-auto 会先检查"过度自信反转":
