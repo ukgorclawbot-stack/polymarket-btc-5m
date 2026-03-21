@@ -18,10 +18,35 @@
  */
 
 import "dotenv/config";
+import fs from "fs";
 import { ClobClient, OrderType, Side, AssetType } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
 import { JsonRpcProvider } from "@ethersproject/providers";
 import { Contract } from "@ethersproject/contracts";
+
+// ── PID 文件锁 (防止重复启动) ──
+const PID_FILE = "/tmp/polymarket-scalp.pid";
+
+function acquirePidLock() {
+  try {
+    if (fs.existsSync(PID_FILE)) {
+      const oldPid = parseInt(fs.readFileSync(PID_FILE, "utf-8").trim());
+      try {
+        process.kill(oldPid, 0); // 测试进程是否存在
+        console.error(`[错误] 已有运行中的实例 (PID ${oldPid}), 请先停止再启动`);
+        process.exit(1);
+      } catch {
+        // 旧进程不存在, PID 文件是残留的
+      }
+    }
+    fs.writeFileSync(PID_FILE, String(process.pid));
+    process.on("exit", () => { try { fs.unlinkSync(PID_FILE); } catch {} });
+    process.on("SIGINT", () => process.exit(0));
+    process.on("SIGTERM", () => process.exit(0));
+  } catch (e) {
+    console.error(`[警告] PID锁获取失败: ${e.message}`);
+  }
+}
 
 // ============ 配置 ============
 
@@ -678,7 +703,25 @@ const MULTISEND_ADDR = "0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761";
 const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
 const ZERO_BYTES32 = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
+// ── Redeem 全局状态 ──
+let _redeemRunning = false;
+let _redeemFailedWindows = new Set(); // 失败过的窗口, 下次优先重试
+
 async function cmdRedeem() {
+  // 防止并发 Redeem (nonce 冲突根源)
+  if (_redeemRunning) {
+    console.log("[Redeem] 跳过: 上一次 Redeem 仍在执行");
+    return;
+  }
+  _redeemRunning = true;
+  try {
+    await _doRedeem();
+  } finally {
+    _redeemRunning = false;
+  }
+}
+
+async function _doRedeem() {
   if (!FUNDER_ADDRESS || SIGNATURE_TYPE !== 2) {
     console.log("[Redeem] 需要 FUNDER_ADDRESS 和 SIGNATURE_TYPE=2 (Gnosis Safe)");
     return;
@@ -691,50 +734,104 @@ async function cmdRedeem() {
   const ctf = new Contract(CTF_ADDRESS, [
     "function balanceOf(address, uint256) view returns (uint256)",
     "function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)",
+    "function payoutNumerators(bytes32, uint256) view returns (uint256)",
   ], provider);
 
   const now = Math.floor(Date.now() / 1000);
   const redeemTxs = [];
 
-  // 检查最近 2~7 个已结算窗口
-  for (let i = 2; i <= 7; i++) {
-    const windowTs = now - (now % MARKET_INTERVAL) - (i * MARKET_INTERVAL);
-    const slug = getMarketSlug(windowTs);
-    const event = await fetchMarket(slug);
-    if (!event) continue;
+  // 扫描最近 2~30 个窗口 (覆盖2.5小时), 加上之前失败的窗口
+  const windowsToCheck = new Set();
+  for (let i = 2; i <= 30; i++) {
+    windowsToCheck.add(now - (now % MARKET_INTERVAL) - (i * MARKET_INTERVAL));
+  }
+  for (const w of _redeemFailedWindows) {
+    windowsToCheck.add(w);
+  }
+  // 清除太老的失败记录 (>6小时)
+  const cutoff = now - 6 * 3600;
+  for (const w of _redeemFailedWindows) {
+    if (w < cutoff) _redeemFailedWindows.delete(w);
+  }
 
-    const market = (event.markets || [])[0];
-    if (!market?.conditionId) continue;
+  // 并行批量查询市场 (每批5个)
+  const windowArr = [...windowsToCheck].sort((a, b) => b - a);
+  for (let batch = 0; batch < windowArr.length; batch += 5) {
+    const batchWindows = windowArr.slice(batch, batch + 5);
+    const results = await Promise.all(batchWindows.map(async (windowTs) => {
+      const slug = getMarketSlug(windowTs);
+      const event = await fetchMarket(slug);
+      if (!event) return null;
 
-    const info = parseMarketTokens(event);
+      const market = (event.markets || [])[0];
+      if (!market?.conditionId) return null;
 
-    let upBal, downBal;
-    try {
-      upBal = info.upTokenId ? await ctf.balanceOf(safeAddress, info.upTokenId) : 0;
-      downBal = info.downTokenId ? await ctf.balanceOf(safeAddress, info.downTokenId) : 0;
-    } catch {
-      continue;
+      const info = parseMarketTokens(event);
+
+      let upBal, downBal;
+      try {
+        upBal = info.upTokenId ? await ctf.balanceOf(safeAddress, info.upTokenId) : 0;
+        downBal = info.downTokenId ? await ctf.balanceOf(safeAddress, info.downTokenId) : 0;
+      } catch {
+        return null;
+      }
+
+      const upZero = typeof upBal === "object" ? upBal.isZero() : upBal === 0;
+      const downZero = typeof downBal === "object" ? downBal.isZero() : downBal === 0;
+      if (upZero && downZero) {
+        // 没有余额, 说明已赎回, 从失败列表移除
+        _redeemFailedWindows.delete(windowTs);
+        return null;
+      }
+
+      let winner = "unknown";
+      try {
+        const p0 = await ctf.payoutNumerators(market.conditionId, 0);
+        const p1 = await ctf.payoutNumerators(market.conditionId, 1);
+        const p0Pos = typeof p0 === "object" ? !p0.isZero() : p0 > 0;
+        const p1Pos = typeof p1 === "object" ? !p1.isZero() : p1 > 0;
+        winner = p0Pos ? "UP" : p1Pos ? "DOWN" : "unresolved";
+      } catch {}
+
+      if (winner === "unresolved") return null; // 未结算, 跳过
+
+      console.log(`[Redeem] ${slug}: UP=${upBal.toString()}, DOWN=${downBal.toString()}, winner=${winner}`);
+
+      const data = ctf.interface.encodeFunctionData("redeemPositions", [
+        USDC_ADDRESS, ZERO_BYTES32, market.conditionId, [1, 2],
+      ]);
+      return { to: CTF_ADDRESS, data, windowTs };
+    }));
+
+    for (const r of results) {
+      if (r) redeemTxs.push(r);
     }
-
-    const upZero = typeof upBal === "object" ? upBal.isZero() : upBal === 0;
-    const downZero = typeof downBal === "object" ? downBal.isZero() : downBal === 0;
-    if (upZero && downZero) continue;
-
-    console.log(`[Redeem] ${slug}: UP=${upBal.toString()}, DOWN=${downBal.toString()}`);
-
-    // 直接调用 CTF.redeemPositions (indexSets: 1=outcome0, 2=outcome1)
-    const data = ctf.interface.encodeFunctionData("redeemPositions", [
-      USDC_ADDRESS, ZERO_BYTES32, market.conditionId, [1, 2],
-    ]);
-    redeemTxs.push({ to: CTF_ADDRESS, data });
   }
 
   if (redeemTxs.length === 0) {
-    console.log("[Redeem] 没有需要赎回的仓位");
-    return;
+    return; // 静默, 不打印噪音
   }
 
-  // 构建 Safe 交易
+  // 分批提交 (每批最多4个, 减少单笔gas消耗和失败风险)
+  const BATCH_SIZE = 4;
+  for (let i = 0; i < redeemTxs.length; i += BATCH_SIZE) {
+    const chunk = redeemTxs.slice(i, i + BATCH_SIZE);
+    const success = await _submitRedeemBatch(signer, safeAddress, provider, chunk);
+    if (!success) {
+      for (const tx of chunk) {
+        _redeemFailedWindows.add(tx.windowTs);
+      }
+    } else {
+      for (const tx of chunk) {
+        _redeemFailedWindows.delete(tx.windowTs);
+      }
+    }
+    // 批次间等待足够久, 确保 nonce 和 mempool 完全更新
+    if (i + BATCH_SIZE < redeemTxs.length) await sleep(8000);
+  }
+}
+
+async function _submitRedeemBatch(signer, safeAddress, provider, redeemTxs) {
   const safeContract = new Contract(safeAddress, [
     "function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address payable refundReceiver, bytes signatures) payable returns (bool)",
     "function nonce() view returns (uint256)",
@@ -744,19 +841,17 @@ async function cmdRedeem() {
   let targetTo, targetData, operation;
 
   if (redeemTxs.length === 1) {
-    // 单笔赎回 — 直接 Call
     targetTo = redeemTxs[0].to;
     targetData = redeemTxs[0].data;
     operation = 0;
   } else {
-    // 多笔赎回 — MultiSend + DelegateCall
     let packedHex = "";
     for (const tx of redeemTxs) {
       const dataNoPrefix = tx.data.slice(2);
       const dataLen = dataNoPrefix.length / 2;
-      packedHex += "00"; // operation = Call
+      packedHex += "00";
       packedHex += tx.to.slice(2).toLowerCase().padStart(40, "0");
-      packedHex += "0".repeat(64); // value = 0
+      packedHex += "0".repeat(64);
       packedHex += dataLen.toString(16).padStart(64, "0");
       packedHex += dataNoPrefix;
     }
@@ -765,36 +860,66 @@ async function cmdRedeem() {
     ], provider);
     targetTo = MULTISEND_ADDR;
     targetData = multiSend.interface.encodeFunctionData("multiSend", ["0x" + packedHex]);
-    operation = 1; // DelegateCall
+    operation = 1;
   }
 
-  const nonce = await safeContract.nonce();
-  const txHash = await safeContract.getTransactionHash(
-    targetTo, 0, targetData, operation, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, nonce
-  );
+  // 重试提交最多4次 (递增gas价格, 等待 pending TX)
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      // 等待所有 pending TX 完成后再获取 nonce (避免 replacement 冲突)
+      if (attempt > 0) {
+        const pendingCount = await provider.getTransactionCount(signer.address, "pending");
+        const confirmedCount = await provider.getTransactionCount(signer.address, "latest");
+        if (pendingCount > confirmedCount) {
+          console.log(`[Redeem] 等待 ${pendingCount - confirmedCount} 笔pending TX确认...`);
+          await sleep(8000);
+        }
+      }
 
-  // eth_sign 签名 (v += 4 表示 Safe 的 eth_sign 类型)
-  const sig = await signer.signMessage(Buffer.from(txHash.slice(2), "hex"));
-  const sigBytes = Buffer.from(sig.slice(2), "hex");
-  sigBytes[64] += 4;
-  const signature = "0x" + sigBytes.toString("hex");
+      const nonce = await safeContract.nonce();
+      const txHash = await safeContract.getTransactionHash(
+        targetTo, 0, targetData, operation, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, nonce
+      );
 
-  console.log(`[Redeem] 提交 Safe 交易 (${redeemTxs.length} 个市场)...`);
-  try {
-    const tx = await safeContract.execTransaction(
-      targetTo, 0, targetData, operation, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, signature,
-      { gasLimit: 500000, maxPriorityFeePerGas: 30000000000n, maxFeePerGas: 100000000000n }
-    );
-    console.log(`[Redeem] TX: ${tx.hash}`);
-    const receipt = await tx.wait();
-    if (receipt.status === 1) {
-      console.log(`[Redeem] 成功赎回 ${redeemTxs.length} 个市场的仓位`);
-    } else {
-      console.log("[Redeem] 交易失败");
+      const sig = await signer.signMessage(Buffer.from(txHash.slice(2), "hex"));
+      const sigBytes = Buffer.from(sig.slice(2), "hex");
+      sigBytes[64] += 4;
+      const signature = "0x" + sigBytes.toString("hex");
+
+      // 高 gas 起步 + 递增 (Polygon 经常需要 50+ gwei)
+      const priorityFee = 50000000000n * BigInt(attempt + 1);  // 50/100/150/200 gwei
+      const maxFee = 300000000000n + priorityFee;               // 350/400/450/500 gwei max
+
+      console.log(`[Redeem] 提交 Safe 交易 (${redeemTxs.length} 个市场)${attempt > 0 ? ` 重试${attempt+1}` : ""}...`);
+      const tx = await safeContract.execTransaction(
+        targetTo, 0, targetData, operation, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, signature,
+        { gasLimit: 400000 + redeemTxs.length * 120000, maxPriorityFeePerGas: priorityFee, maxFeePerGas: maxFee }
+      );
+      console.log(`[Redeem] TX: ${tx.hash}`);
+      // 带超时的等待 (最多60秒, 防止 tx.wait() 永久阻塞)
+      const receipt = await Promise.race([
+        tx.wait(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("TX确认超时60s")), 60000)),
+      ]);
+      if (receipt.status === 1) {
+        console.log(`[Redeem] 成功赎回 ${redeemTxs.length} 个市场的仓位`);
+        return true;
+      }
+      console.log("[Redeem] 交易reverted (status=0), 可能已被其他TX赎回");
+      return false; // on-chain revert = data问题, 不再重试相同数据
+    } catch (e) {
+      const msg = (e.reason || e.message || "").slice(0, 80);
+      console.log(`[Redeem] 执行失败: ${msg}`);
+      // nonce/gas/超时 相关错误 → 重试
+      if (msg.includes("replacement") || msg.includes("nonce") || msg.includes("replaced") || msg.includes("transaction failed") || msg.includes("underpriced") || msg.includes("超时")) {
+        await sleep(6000 * (attempt + 1));
+        continue;
+      }
+      // 其他错误直接放弃本批
+      break;
     }
-  } catch (e) {
-    console.log(`[Redeem] 执行失败: ${(e.reason || e.message || "").slice(0, 100)}`);
   }
+  return false;
 }
 
 // 连续自动策略模式
@@ -857,6 +982,269 @@ async function cmdStrategyAuto(amount) {
       await new Promise((r) => setTimeout(r, 10000));
     }
   }
+}
+
+// ============ 刷单策略 (Scalping) ============
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function cmdScalp(betAmount) {
+  acquirePidLock(); // 防止重复启动
+  betAmount = betAmount || parseFloat(process.env.SCALP_AMOUNT || "1");
+
+  // 策略参数 (可通过环境变量覆盖)
+  const TP = parseFloat(process.env.SCALP_TP || "0.03");          // 止盈: token涨3分
+  const SL = parseFloat(process.env.SCALP_SL || "0.05");          // 止损: token跌5分
+  const BTC_TRIGGER = parseFloat(process.env.SCALP_TRIGGER || "0.015"); // BTC变动触发 (%)
+  const LOOKBACK_MS = 15000;                                       // BTC回看15秒
+  const POLL_MS = 2000;                                            // 轮询间隔2秒
+  const EXIT_BEFORE_S = 45;                                        // 结束前45秒平仓
+  const MIN_HOLD_S = 90;                                           // 最少持仓90秒 (等链上结算)
+  const MAX_TRADES = parseInt(process.env.SCALP_MAX_TRADES || "5");
+  const COOLDOWN_MS = 10000;                                       // 交易间冷却10秒
+  const MIN_BALANCE = betAmount * 2;                                // 最低余额: 2倍单笔
+
+  console.log(`[刷单] 参数: 单笔=$${betAmount} 止盈=${(TP*100).toFixed(0)}¢ 止损=${(SL*100).toFixed(0)}¢ BTC阈值=${BTC_TRIGGER}%`);
+  console.log(`[刷单] 每窗口最多${MAX_TRADES}笔, 冷却${COOLDOWN_MS/1000}s, ${EXIT_BEFORE_S}s前清仓`);
+  console.log(`[刷单] 最低余额=$${MIN_BALANCE} | 按 Ctrl+C 停止\n`);
+
+  const client = await getClient();
+  let lastWindow = null;
+  let position = null;  // {side, tokenId, entryPrice, tokens, cost, negRisk}
+  let windowTrades = 0;
+  let lastTradeMs = 0;
+  const stats = { wins: 0, losses: 0, pnl: 0 };
+  const btcBuf = [];    // [{ts, price}]
+  let lastStatusLog = 0;
+  let lastBalanceCheck = 0;
+  let cachedBalance = null;
+  let consecutiveRedeemWindows = 0; // 连续多少个窗口触发了redeem
+  let lowBalanceWarned = false;
+
+  while (true) {
+    try {
+      const win = getCurrentWindowTs();
+      const remaining = getSecondsUntilClose();
+
+      // ── 新窗口 ──
+      if (win !== lastWindow) {
+        if (position) {
+          await scalpExit(client, position, stats, "窗口结束");
+          position = null;
+        }
+
+        lastWindow = win;
+        windowTrades = 0;
+        btcBuf.length = 0;
+        lowBalanceWarned = false;
+        console.log(`\n[刷单] ═══ 窗口 ${win} (${new Date(win * 1000).toISOString()}) ═══`);
+        console.log(`[刷单] 累计: ${stats.wins + stats.losses}笔 W${stats.wins}/L${stats.losses} PnL=$${stats.pnl.toFixed(2)}`);
+
+        // 异步redeem，不阻塞主循环
+        cmdRedeem().catch(e => console.log(`[刷单] Redeem错误: ${(e.message||"").slice(0,60)}`));
+      }
+
+      // ── 定期检查余额 (每60秒) ──
+      const now = Date.now();
+      if (now - lastBalanceCheck > 60000) {
+        try {
+          const collateral = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+          cachedBalance = parseFloat(collateral.balance || "0") / 1e6;
+          lastBalanceCheck = now;
+        } catch {}
+      }
+
+      // ── 余额不足: 触发紧急Redeem ──
+      if (cachedBalance !== null && cachedBalance < MIN_BALANCE && !position) {
+        if (!lowBalanceWarned) {
+          console.log(`[刷单] ⚠️ 余额不足 $${cachedBalance.toFixed(2)} < $${MIN_BALANCE}, 等待Redeem回款...`);
+          lowBalanceWarned = true;
+          // 立即触发一次Redeem (如果没有在跑)
+          cmdRedeem().catch(e => {});
+        }
+        await sleep(POLL_MS * 2);
+        lastBalanceCheck = 0; // 强制下次重新检查余额
+        continue;
+      }
+
+      // ── 获取实时数据 ──
+      const [btcPrice, event] = await Promise.all([fetchBtcPrice(), getCurrentMarket()]);
+      if (!event) { await sleep(POLL_MS); continue; }
+      const info = parseMarketTokens(event);
+
+      // BTC价格追踪
+      btcBuf.push({ ts: now, price: btcPrice });
+      while (btcBuf.length > 0 && now - btcBuf[0].ts > 60000) btcBuf.shift();
+
+      // ── 临近结束: 强制平仓 ──
+      if (remaining < EXIT_BEFORE_S) {
+        if (position) {
+          await scalpExit(client, position, stats, "临近结束");
+          position = null;
+        }
+        await sleep(POLL_MS);
+        continue;
+      }
+
+      // ── 有持仓: 监控止盈/止损 ──
+      if (position) {
+        const curPrice = position.side === "UP" ? info.upPrice : info.downPrice;
+        const diff = curPrice - position.entryPrice;
+        const holdSec = (now - position.entryTime) / 1000;
+
+        // 必须持仓至少 MIN_HOLD_S 秒, 等链上结算完成
+        if (holdSec >= MIN_HOLD_S) {
+          if (diff >= TP) {
+            await scalpExit(client, position, stats, `止盈 +${(diff * 100).toFixed(0)}¢ (持${holdSec.toFixed(0)}s)`);
+            position = null;
+            lastTradeMs = now;
+          } else if (diff <= -SL) {
+            await scalpExit(client, position, stats, `止损 ${(diff * 100).toFixed(0)}¢ (持${holdSec.toFixed(0)}s)`);
+            position = null;
+            lastTradeMs = now;
+          }
+        }
+      }
+
+      // ── 无持仓: 寻找入场信号 (需至少 MIN_HOLD_S+EXIT_BEFORE_S 秒) ──
+      if (!position && windowTrades < MAX_TRADES && remaining > MIN_HOLD_S + EXIT_BEFORE_S && now - lastTradeMs > COOLDOWN_MS) {
+        const oldest = btcBuf.find(p => p.ts >= now - LOOKBACK_MS);
+        if (oldest && btcBuf.length >= 5) {
+          const btcChg = ((btcPrice - oldest.price) / oldest.price) * 100;
+
+          // 每30秒输出状态
+          if (now - lastStatusLog > 30000) {
+            console.log(`[刷单] BTC=$${btcPrice.toFixed(0)} 15s变动=${btcChg > 0 ? "+" : ""}${btcChg.toFixed(4)}% UP=$${info.upPrice.toFixed(2)} DOWN=$${info.downPrice.toFixed(2)} 剩余${remaining}s`);
+            lastStatusLog = now;
+          }
+
+          let side = null;
+          if (btcChg > BTC_TRIGGER) side = "UP";
+          else if (btcChg < -BTC_TRIGGER) side = "DOWN";
+
+          if (side) {
+            position = await scalpEnter(client, side, betAmount, info);
+            if (position) {
+              windowTrades++;
+              lastTradeMs = now;
+              lastBalanceCheck = 0; // 交易后立即重新检查余额
+              console.log(`[刷单] 开仓 ${side} $${position.cost.toFixed(2)} → ${position.tokens.toFixed(3)} tokens @$${position.entryPrice.toFixed(3)} (BTC ${btcChg > 0 ? "+" : ""}${btcChg.toFixed(3)}%)`);
+            }
+          }
+        }
+      }
+
+      await sleep(POLL_MS);
+    } catch (e) {
+      console.error(`[刷单] 错误: ${(e.message || "").slice(0, 80)}`);
+      await sleep(5000);
+    }
+  }
+}
+
+async function scalpEnter(client, side, amount, info) {
+  const tokenId = side === "UP" ? info.upTokenId : info.downTokenId;
+  const entryPrice = side === "UP" ? info.upPrice : info.downPrice;
+
+  // 限价买入, 最多高于当前价 15¢ (防止过度滑点)
+  const maxPrice = Math.min(entryPrice + 0.15, 0.95);
+  try {
+    const resp = await client.createAndPostMarketOrder(
+      { tokenID: tokenId, amount, side: Side.BUY, price: maxPrice },
+      { negRisk: info.negRisk },
+      OrderType.FOK,
+    );
+
+    if (resp.success) {
+      let tokens = parseFloat(resp.takingAmount || "0");
+      let cost = parseFloat(resp.makingAmount || amount.toString());
+      // CLOB 返回的是微单位 (1e6), 需要转换
+      if (tokens > 1000) tokens = tokens / 1e6;
+      if (cost > 1000) cost = cost / 1e6;
+
+      // 等待链上结算 + 同步CLOB余额 (卖出前必须)
+      // Polygon结算需要时间, 等待充分后再同步
+      await sleep(8000);
+      for (let retry = 0; retry < 3; retry++) {
+        try {
+          await client.updateBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: tokenId });
+          console.log(`[刷单] 余额同步成功 (尝试${retry + 1})`);
+          break;
+        } catch (e) {
+          console.log(`[刷单] 余额同步失败 (尝试${retry + 1}): ${(e.message||"").slice(0,40)}`);
+          await sleep(5000);
+        }
+      }
+
+      return { side, tokenId, entryPrice, tokens, cost, negRisk: info.negRisk, entryTime: Date.now() };
+    }
+    console.log(`[刷单] 买入失败: ${resp.errorMsg || resp.error || "未知"}`);
+  } catch (e) {
+    console.log(`[刷单] 买入错误: ${e.message?.slice(0, 60)}`);
+  }
+  return null;
+}
+
+async function scalpExit(client, pos, stats, reason) {
+  if (!pos || pos.tokens <= 0) return;
+
+  // 查询 CLOB 实际余额, 取 99% 防止服务端余额缓存bug (GitHub Issue #287)
+  let sellAmount = pos.tokens;
+  try {
+    await client.updateBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: pos.tokenId });
+    await sleep(500);
+    const bal = await client.getBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: pos.tokenId });
+    const clobBalance = parseFloat(bal.balance || "0") / 1e6;
+    if (clobBalance > 0) {
+      sellAmount = Math.min(sellAmount, clobBalance);
+    }
+  } catch {}
+  // 取 99% + floor 防止浮点精度问题
+  sellAmount = Math.floor(sellAmount * 0.99 * 1e4) / 1e4;
+  if (sellAmount <= 0) {
+    console.log(`[平仓] ${reason} | 无可卖余额, 持有到结算`);
+    return;
+  }
+
+  console.log(`[平仓] ${reason} | SELL ${pos.side} ${sellAmount.toFixed(4)} tokens (原${pos.tokens.toFixed(3)})`);
+
+  // 重试卖出 (递增延迟, 最多4次)
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (attempt > 0) {
+      await sleep(2000 * attempt);
+      // 重新同步余额
+      try {
+        await client.updateBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: pos.tokenId });
+      } catch {}
+      console.log(`[平仓] 重试 ${attempt + 1}/4...`);
+    }
+
+    try {
+      const resp = await client.createAndPostMarketOrder(
+        { tokenID: pos.tokenId, amount: sellAmount, side: Side.SELL, price: 0.01 },
+        { negRisk: pos.negRisk },
+        OrderType.FOK,
+      );
+
+      if (resp.success) {
+        const received = parseFloat(resp.takingAmount || "0");
+        const pnl = received > 0 ? received - pos.cost : 0;
+        stats.pnl += pnl;
+        if (pnl >= 0) stats.wins++; else stats.losses++;
+        console.log(`[平仓] 成功 收回=$${received.toFixed(3)} PnL=$${pnl.toFixed(3)} | 累计W${stats.wins}/L${stats.losses} $${stats.pnl.toFixed(2)}`);
+        return;
+      }
+      // 流动性不足 → 减少卖出量再试
+      if ((resp.error || "").includes("fully filled")) {
+        sellAmount = Math.floor(sellAmount * 0.5 * 1e4) / 1e4;
+        console.log(`[平仓] 流动性不足, 减量到 ${sellAmount.toFixed(4)}`);
+      }
+    } catch (e) {
+      console.log(`[平仓] 错误: ${(e.message||"").slice(0,50)}`);
+    }
+  }
+
+  console.log(`[平仓] 卖出失败, 持有到结算`);
 }
 
 // ============ 主入口 ============
@@ -931,6 +1319,12 @@ async function main() {
       break;
     }
 
+    case "scalp": {
+      const amount = args[1] ? parseFloat(args[1]) : undefined;
+      await cmdScalp(amount);
+      break;
+    }
+
     case "redeem":
     case "claim":
       await cmdRedeem();
@@ -951,6 +1345,7 @@ Polymarket BTC 5分钟市场下单工具
   auto <up|down> [金额]         自动模式 (每个窗口自动下单)
   strategy [金额]               Binance趋势策略 (单次评估并下单)
   strategy-auto [金额]          Binance趋势策略 (连续自动)
+  scalp [金额]                  刷单策略 (止盈止损, 一窗口多单)
   redeem / claim                领取获胜仓位奖励 (手动)
 
 策略模式说明:
@@ -961,6 +1356,14 @@ Polymarket BTC 5分钟市场下单工具
     - 低波动 + 最后1分钟下跌 → 反转模式 (买UP)
     - 正常波动 → 趋势模式 (跟随综合评分)
 
+刷单策略说明 (scalp):
+  不等窗口结算, 通过快速买卖赚取价差:
+    - 监控BTC价格 15秒变动 > 0.03% → 入场
+    - 止盈 3¢ / 止损 5¢ → 自动平仓
+    - 每窗口最多5单, 冷却10秒
+    - 结束前45秒强制平仓
+  环境变量: SCALP_TP, SCALP_SL, SCALP_TRIGGER, SCALP_MAX_TRADES, SCALP_AMOUNT
+
 示例:
   node index.mjs info
   node index.mjs buy up
@@ -969,6 +1372,7 @@ Polymarket BTC 5分钟市场下单工具
   node index.mjs auto up 5
   node index.mjs strategy
   node index.mjs strategy-auto 10
+  node index.mjs scalp 1
       `);
   }
 }
